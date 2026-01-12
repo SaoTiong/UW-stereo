@@ -279,6 +279,20 @@ class Middlebury(StereoDataset):
                 self.image_list += [ [img1, img2] ]
                 self.disparity_list += [ disp ]
 
+
+class UWStereo(StereoDataset):
+    def __init__(self, aug_params=None, root='/home/tong/datasets/UW-stereo/output40000'):
+        super().__init__(aug_params, reader=frame_utils.readDispNpy)
+
+        left_images = sorted(glob(osp.join(root, 'image_left', '*')))
+        right_images = sorted(glob(osp.join(root, 'image_right', '*')))
+        disp_list = sorted(glob(osp.join(root, 'depth_left', '*.npy')))
+
+        for img1, img2, disp in zip(left_images, right_images, disp_list):
+            self.image_list += [[img1, img2]]
+            self.disparity_list += [disp]
+
+
   
 def fetch_dataloader(args):
     """ Create the data loader for the corresponding trainign set """
@@ -312,6 +326,9 @@ def fetch_dataloader(args):
         elif dataset_name.startswith('tartan_air'):
             new_dataset = TartanAir(aug_params, keywords=dataset_name.split('_')[2:])
             logging.info(f"Adding {len(new_dataset)} samples from Tartain Air")
+        elif dataset_name == 'uwstereo':
+            new_dataset = UWStereo(aug_params)
+            logging.info(f"Adding {len(new_dataset)} samples from UW Stereo")
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 

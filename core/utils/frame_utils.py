@@ -189,3 +189,8 @@ def read_gen(file_name, pil=False):
         else:
             return flow[:, :, :-1]
     return []
+
+def readDispNpy(file_name):
+    disp = np.load(file_name).astype(np.float32)
+    valid = disp > 0
+    return disp, valid
