@@ -281,7 +281,7 @@ class Middlebury(StereoDataset):
 
 
 class UWStereo(StereoDataset):
-    def __init__(self, aug_params=None, root='/home/tong/datasets/UW-stereo/output40000'):
+    def __init__(self, aug_params=None, root='/home/tong/datasets/UW-Stereo/output_40000'):
         super().__init__(aug_params, reader=frame_utils.readDispNpy)
 
         left_images = sorted(glob(osp.join(root, 'image_left', '*')))
