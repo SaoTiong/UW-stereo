@@ -281,16 +281,41 @@ class Middlebury(StereoDataset):
 
 
 class UWStereo(StereoDataset):
-    def __init__(self, aug_params=None, root='/home/tong/datasets/UW-Stereo/output_40000'):
+    def __init__(self, aug_params=None, root='/home/tong/datasets/UW-Stereo/output_40000', split='TRAIN'):
         super().__init__(aug_params, reader=frame_utils.readDispNpy)
 
         left_images = sorted(glob(osp.join(root, 'image_left', '*')))
         right_images = sorted(glob(osp.join(root, 'image_right', '*')))
         disp_list = sorted(glob(osp.join(root, 'depth_left', '*.npy')))
 
-        for img1, img2, disp in zip(left_images, right_images, disp_list):
-            self.image_list += [[img1, img2]]
-            self.disparity_list += [disp]
+        assert len(left_images) == len(right_images) == len(disp_list), "UW-Stereo lists mismatch"
+
+        total_len = len(left_images)
+        val_len = min(1000, total_len)
+        train_len = total_len - val_len
+
+        idxs = np.arange(total_len)
+        rng = np.random.RandomState(42)
+        rng.shuffle(idxs)
+
+        if split == 'TRAIN':
+            selected_idxs = idxs[:train_len]
+        else:
+            selected_idxs = idxs[train_len:]
+
+        for i in selected_idxs:
+            self.image_list += [[left_images[i], right_images[i]]]
+            self.disparity_list += [disp_list[i]]
+
+        logging.info(f"Loaded UW-Stereo {split} set: {len(self.image_list)} samples")
+
+    def __getitem__(self, index):
+        meta, img1, img2, flow, valid = super().__getitem__(index)
+        # Convert BGR -> RGB (images already torch tensors [3,H,W])
+        img1 = img1[[2, 1, 0], :, :]
+        img2 = img2[[2, 1, 0], :, :]
+        return meta, img1, img2, flow, valid
+
 
 
   

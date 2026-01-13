@@ -185,7 +185,7 @@ def train(args):
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
 
-                results = validate_things(model.module, iters=args.valid_iters)
+                results = validate_uw_stereo(model.module, iters=args.valid_iters)
 
                 logger.write_dict(results)
 

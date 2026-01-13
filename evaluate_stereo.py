@@ -189,6 +189,41 @@ def validate_middlebury(model, iters=32, split='F', mixed_prec=False):
     return {f'middlebury{split}-epe': epe, f'middlebury{split}-d1': d1}
 
 
+@torch.no_grad()
+@torch.no_grad()
+def validate_uw_stereo(model, iters=32, mixed_prec=False, root='/home/tong/datasets/UW-Stereo/output_40000'):
+    model.eval()
+    aug_params = {}
+    val_dataset = datasets.UWStereo(aug_params, root=root, split='VAL')
+
+    out_list, epe_list = [], []
+    for val_id in tqdm(range(len(val_dataset))):
+        _, image1, image2, flow_gt, valid_gt = val_dataset[val_id]
+        image1 = image1[None].cuda()
+        image2 = image2[None].cuda()
+
+        padder = InputPadder(image1.shape, divis_by=32)
+        image1, image2 = padder.pad(image1, image2)
+
+        with autocast(enabled=mixed_prec):
+            _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
+
+        flow_pr = padder.unpad(flow_pr).cpu().squeeze(0)
+        epe = torch.sum((flow_pr - flow_gt)**2, dim=0).sqrt()
+        epe = epe.flatten()
+        val = (valid_gt.flatten() >= 0.5)
+
+        out = (epe > 1.0)
+        epe_list.append(epe[val].mean().item())
+        out_list.append(out[val].cpu().numpy())
+
+    epe = np.mean(epe_list)
+    d1 = 100 * np.mean(np.concatenate(out_list))
+    print("Validation UW-Stereo: EPE %f, D1 %f" % (epe, d1))
+    return {'uw-epe': epe, 'uw-d1': d1}
+
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint", default=None)
