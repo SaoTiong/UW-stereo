@@ -2,6 +2,16 @@ from __future__ import print_function, division
 
 import argparse
 import logging
+
+
+import os  # <--- Add this
+
+# --- CRITICAL FIX START ---
+# Must be set BEFORE import numpy or import torch
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -130,9 +140,9 @@ class Logger:
 
 
 def train(args):
-
-    model = nn.DataParallel(RAFTStereo(args))
-    print("Parameter Count: %d" % count_parameters(model))
+    model = RAFTStereo(args)
+    # model = nn.DataParallel(RAFTStereo(args))
+    # print("Parameter Count: %d" % count_parameters(model))
 
     train_loader = datasets.fetch_dataloader(args)
     optimizer, scheduler = fetch_optimizer(args, model)
@@ -143,11 +153,18 @@ def train(args):
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
         checkpoint = torch.load(args.restore_ckpt)
-        model.load_state_dict(checkpoint, strict=True)
+        # model.load_state_dict(checkpoint, strict=True)
+        # logging.info(f"Done loading checkpoint")
+        new_state_dict = {k.replace('module.', ''): v for k, v in checkpoint.items()}
+        model.load_state_dict(new_state_dict, strict=True)
         logging.info(f"Done loading checkpoint")
 
     model.cuda()
+    
     model.train()
+
+    model = nn.DataParallel(model)
+    
     model.module.freeze_bn() # We keep BatchNorm frozen
 
     validation_frequency = 10000
@@ -185,7 +202,23 @@ def train(args):
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
 
-                results = validate_things(model.module, iters=args.valid_iters)
+                if args.val_dataset == 'things':
+                    results = validate_things(model.module, iters=args.valid_iters)
+                elif args.val_dataset == 'eth3d':
+                    results = validate_eth3d(model.module, iters=args.valid_iters)
+                elif args.val_dataset == 'kitti':
+                    results = validate_kitti(model.module, iters=args.valid_iters)
+                elif args.val_dataset == 'uwstereo':
+                    results = validate_uwstereo(
+                        model.module,
+                        iters=args.valid_iters,
+                        root=args.uwstereo_root,
+                        list_file=args.uwstereo_val_list,
+                    )
+                elif args.val_dataset in [f"middlebury_{s}" for s in 'FHQ']:
+                    results = validate_middlebury(model.module, iters=args.valid_iters, split=args.val_dataset[-1])
+                else:
+                    raise ValueError(f"Unknown val_dataset: {args.val_dataset}")
 
                 logger.write_dict(results)
 
@@ -228,6 +261,7 @@ if __name__ == '__main__':
 
     # Validation parameters
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during validation forward pass')
+    parser.add_argument('--val_dataset', default='things', choices=['things', 'eth3d', 'kitti', 'uwstereo'] + [f"middlebury_{s}" for s in 'FHQ'], help='dataset for periodic validation')
 
     # Architecure choices
     parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
@@ -246,6 +280,9 @@ if __name__ == '__main__':
     parser.add_argument('--do_flip', default=False, choices=['h', 'v'], help='flip the images horizontally or vertically')
     parser.add_argument('--spatial_scale', type=float, nargs='+', default=[0, 0], help='re-scale the images randomly')
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
+    parser.add_argument('--uwstereo_root', default='datasets/uwstereo', help='root folder for UW Stereo data')
+    parser.add_argument('--uwstereo_train_list', default='all_train.txt', help='UW Stereo train list file')
+    parser.add_argument('--uwstereo_val_list', default='all_test.txt', help='UW Stereo validation list file')
     args = parser.parse_args()
 
     torch.manual_seed(1234)

@@ -188,13 +188,62 @@ def validate_middlebury(model, iters=32, split='F', mixed_prec=False):
     print(f"Validation Middlebury{split}: EPE {epe}, D1 {d1}")
     return {f'middlebury{split}-epe': epe, f'middlebury{split}-d1': d1}
 
+@torch.no_grad()
+def validate_uwstereo(model, iters=32, root='/home/tong/datasets/uwstereo', list_file='all_test.txt', mixed_prec=False):
+    """ Perform validation using a UW Stereo list file """
+    model.eval()
+    aug_params = {}
+    val_dataset = datasets.UWstereoList(aug_params, root=root, list_file=list_file)
+
+    out_list, epe_list = [], []
+    total_err = 0.0
+    total_bad = 0.0
+    total_valid = 0
+    for val_id in range(len(val_dataset)):
+        _, image1, image2, flow_gt, valid_gt = val_dataset[val_id]
+        image1 = image1[None].cuda()
+        image2 = image2[None].cuda()
+
+        padder = InputPadder(image1.shape, divis_by=32)
+        image1, image2 = padder.pad(image1, image2)
+
+        with autocast(enabled=mixed_prec):
+            _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
+        flow_pr = padder.unpad(flow_pr.float()).cpu().squeeze(0)
+        assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
+        disp_err = (flow_pr[0] - flow_gt[0]).abs()
+
+        disp_err_flat = disp_err.flatten()
+        val = valid_gt.flatten() >= 0.5
+
+        out = (disp_err_flat > 3.0)
+        image_out = out[val].float().mean().item()
+        image_epe = disp_err_flat[val].mean().item()
+        logging.info(f"UW Stereo {val_id+1} out of {len(val_dataset)}. EPE {round(image_epe,4)} Bad3 {round(image_out,4)}")
+        epe_list.append(image_epe)
+        out_list.append(image_out)
+        total_err += disp_err_flat[val].sum().item()
+        total_bad += out[val].float().sum().item()
+        total_valid += int(val.sum().item())
+
+    epe_list = np.array(epe_list)
+    out_list = np.array(out_list)
+
+    epe = (total_err / total_valid) if total_valid > 0 else float('nan')
+    bad3 = 100 * (total_bad / total_valid) if total_valid > 0 else float('nan')
+
+    print(f"Validation UW Stereo: EPE {epe}, Bad3 {bad3}")
+    return {'uwstereo-epe': epe, 'uwstereo-bad3': bad3}
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint", default=None)
-    parser.add_argument('--dataset', help="dataset for evaluation", required=True, choices=["eth3d", "kitti", "things"] + [f"middlebury_{s}" for s in 'FHQ'])
+    parser.add_argument('--dataset', help="dataset for evaluation", required=True, choices=["eth3d", "kitti", "things", "uwstereo"] + [f"middlebury_{s}" for s in 'FHQ'])
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during forward pass')
+    parser.add_argument('--uwstereo_root', default='datasets/uwstereo', help='root folder for UW Stereo data')
+    parser.add_argument('--uwstereo_list', default='all_test.txt', help='UW Stereo list file for evaluation')
 
     # Architecure choices
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
@@ -241,3 +290,6 @@ if __name__ == '__main__':
 
     elif args.dataset == 'things':
         validate_things(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)
+
+    elif args.dataset == 'uwstereo':
+        validate_uwstereo(model, iters=args.valid_iters, root=args.uwstereo_root, list_file=args.uwstereo_list, mixed_prec=use_mixed_precision)
