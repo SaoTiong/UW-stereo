@@ -280,36 +280,23 @@ class Middlebury(StereoDataset):
                 self.disparity_list += [ disp ]
 
 class UWstereo(StereoDataset):
-    def __init__(self, aug_params=None, root='/home/tong/datasets/uwstereo', list_file='all_train.txt'):
+    def __init__(self, aug_params=None, root='/home/tong/datasets/uwstereo/UWScene', list_file='all_train.txt'):
         super(UWstereo, self).__init__(aug_params)
         list_path = list_file if osp.isabs(list_file) else osp.join(root, list_file)
         if not osp.exists(list_path):
             raise FileNotFoundError(f"UWstereo list file not found: {list_path}")
 
-        base_root = root
-        alt_root = osp.join(root, "UWScene")
-
         with open(list_path, 'r') as f:
             lines = [line.strip() for line in f if line.strip()]
-
-        def resolve_path(path):
-            if osp.isabs(path):
-                return path
-            candidate = osp.join(base_root, path)
-            if osp.exists(candidate):
-                return candidate
-            if osp.exists(alt_root):
-                return osp.join(alt_root, path)
-            return candidate
 
         for line in lines:
             parts = line.split()
             if len(parts) < 3:
                 raise ValueError(f"Expected 3 columns (left right disp), got: {line}")
             img1, img2, disp = parts[:3]
-            img1 = resolve_path(img1)
-            img2 = resolve_path(img2)
-            disp = resolve_path(disp)
+            img1 = img1 if osp.isabs(img1) else osp.join(root, img1)
+            img2 = img2 if osp.isabs(img2) else osp.join(root, img2)
+            disp = disp if osp.isabs(disp) else osp.join(root, disp)
             self.image_list += [ [img1, img2] ]
             self.disparity_list += [ disp ]
 
@@ -347,9 +334,7 @@ def fetch_dataloader(args):
             new_dataset = TartanAir(aug_params, keywords=dataset_name.split('_')[2:])
             logging.info(f"Adding {len(new_dataset)} samples from Tartain Air")
         elif dataset_name == 'uwstereo':
-            root = getattr(args, "uwstereo_root", "datasets/uwstereo")
-            list_file = getattr(args, "uwstereo_train_list", "all_train.txt")
-            new_dataset = UWstereo(aug_params, root=root, list_file=list_file)
+            new_dataset = UWstereo(aug_params)
             logging.info(f"Adding {len(new_dataset)} samples from UW Stereo")
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 

@@ -2,16 +2,6 @@ from __future__ import print_function, division
 
 import argparse
 import logging
-
-
-import os  # <--- Add this
-
-# --- CRITICAL FIX START ---
-# Must be set BEFORE import numpy or import torch
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -20,13 +10,20 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+
+import os
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from core.raft_stereo import RAFTStereo
 
 from evaluate_stereo import *
 import core.stereo_datasets as datasets
 
 try:
-    from torch.cuda.amp import GradScaler
+    from torch.amp import GradScaler
 except:
     # dummy GradScaler for PyTorch < 1.6
     class GradScaler:
@@ -41,6 +38,15 @@ except:
         def update(self):
             pass
 
+
+def ddp_setup():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        backend = os.environ.get("DDP_BACKEND", "nccl")
+        dist.init_process_group(backend=backend, init_method="env://")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return True, local_rank, int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    return False, 0, 0, 1
 
 def sequence_loss(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700):
     """ Loss function defined over sequence of flow predictions """
@@ -93,14 +99,17 @@ class Logger:
 
     SUM_FREQ = 100
 
-    def __init__(self, model, scheduler):
+    def __init__(self, model, scheduler, is_main=True):
         self.model = model
         self.scheduler = scheduler
         self.total_steps = 0
         self.running_loss = {}
-        self.writer = SummaryWriter(log_dir='runs')
+        self.is_main = is_main
+        self.writer = SummaryWriter(log_dir='runs') if is_main else None
 
     def _print_training_status(self):
+        if not self.is_main:
+            return
         metrics_data = [self.running_loss[k]/Logger.SUM_FREQ for k in sorted(self.running_loss.keys())]
         training_str = "[{:6d}, {:10.7f}] ".format(self.total_steps+1, self.scheduler.get_last_lr()[0])
         metrics_str = ("{:10.4f}, "*len(metrics_data)).format(*metrics_data)
@@ -136,72 +145,89 @@ class Logger:
             self.writer.add_scalar(key, results[key], self.total_steps)
 
     def close(self):
-        self.writer.close()
+        if self.writer is not None:
+            self.writer.close()
 
 
 def train(args):
-    model = RAFTStereo(args)
-    # model = nn.DataParallel(RAFTStereo(args))
-    # print("Parameter Count: %d" % count_parameters(model))
+
+    distributed, local_rank, rank, world_size = ddp_setup()
+    device = torch.device("cuda", local_rank)
+
+    model = RAFTStereo(args).to(device)
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    if rank == 0:
+        print("Parameter Count: %d" % count_parameters(model))
 
     train_loader = datasets.fetch_dataloader(args)
+    if distributed:
+        dataset = train_loader.dataset
+        per_gpu_batch = max(1, args.batch_size // world_size)
+        if rank == 0 and args.batch_size % world_size != 0:
+            logging.warning(
+                "batch_size %d not divisible by world_size %d, using per-gpu batch %d",
+                args.batch_size,
+                world_size,
+                per_gpu_batch,
+            )
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+        train_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=per_gpu_batch,
+            sampler=sampler,
+            num_workers=train_loader.num_workers,
+            pin_memory=train_loader.pin_memory,
+            drop_last=train_loader.drop_last,
+        )
+
     optimizer, scheduler = fetch_optimizer(args, model)
     total_steps = 0
-    logger = Logger(model, scheduler)
+    logger = Logger(model, scheduler, is_main=(rank == 0))
 
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
-        logging.info("Loading checkpoint...")
-        checkpoint = torch.load(args.restore_ckpt)
-        # model.load_state_dict(checkpoint, strict=True)
-        # logging.info(f"Done loading checkpoint")
-        new_state_dict = {k.replace('module.', ''): v for k, v in checkpoint.items()}
-        model.load_state_dict(new_state_dict, strict=True)
-        logging.info(f"Done loading checkpoint")
+        if rank == 0:
+            logging.info("Loading checkpoint...")
+        checkpoint = torch.load(args.restore_ckpt, map_location="cpu")
+        model.load_state_dict(checkpoint, strict=True)
+        if rank == 0:
+            logging.info(f"Done loading checkpoint")
 
-    model.cuda()
-    
     model.train()
-
-    model = nn.DataParallel(model)
-    
-    model.module.freeze_bn() # We keep BatchNorm frozen
+    base_model = model.module if distributed else model
+    base_model.freeze_bn() # We keep BatchNorm frozen
 
     validation_frequency = 10000
 
-    scaler = GradScaler(enabled=args.mixed_precision)
+    scaler = GradScaler('cuda', enabled=args.mixed_precision)
 
     should_keep_training = True
     global_batch_num = 0
+    epoch = 0
     while should_keep_training:
+        if distributed:
+            train_loader.sampler.set_epoch(epoch)
 
-        for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
-            # optimizer.zero_grad()
-            # image1, image2, flow, valid = [x.cuda() for x in data_blob]
-
-            # assert model.training
-            # flow_predictions = model(image1, image2, iters=args.train_iters)
-            # assert model.training
-
+        for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader, disable=(rank != 0))):
             optimizer.zero_grad()
-            
-            # --- FIX START ---
-            image1, image2, flow, valid = data_blob
-            
-            # Move LABELS to GPU 0 (for loss calculation)
-            flow = flow.cuda()
-            valid = valid.cuda()
-            
-            # Keep IMAGES on CPU! 
-            # DataParallel will handle moving them to GPU 0 and GPU 1 safely.
-            # --- FIX END ---
+            image1, image2, flow, valid = [x.to(device, non_blocking=True) for x in data_blob]
 
             assert model.training
             flow_predictions = model(image1, image2, iters=args.train_iters)
+            assert model.training
 
             loss, metrics = sequence_loss(flow_predictions, flow, valid)
-            logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
-            logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
+            if logger.writer is not None:
+                logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
+                logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
             global_batch_num += 1
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -214,32 +240,24 @@ def train(args):
             logger.push(metrics)
 
             if total_steps % validation_frequency == validation_frequency - 1:
-                save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
-                logging.info(f"Saving file {save_path.absolute()}")
-                torch.save(model.state_dict(), save_path)
+                if rank == 0:
+                    save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+                    logging.info(f"Saving file {save_path.absolute()}")
+                    torch.save(model.state_dict(), save_path)
 
-                if args.val_dataset == 'things':
-                    results = validate_things(model.module, iters=args.valid_iters)
-                elif args.val_dataset == 'eth3d':
-                    results = validate_eth3d(model.module, iters=args.valid_iters)
-                elif args.val_dataset == 'kitti':
-                    results = validate_kitti(model.module, iters=args.valid_iters)
-                elif args.val_dataset == 'uwstereo':
-                    results = validate_uwstereo(
-                        model.module,
-                        iters=args.valid_iters,
-                        root=args.uwstereo_root,
-                        list_file=args.uwstereo_val_list,
-                    )
-                elif args.val_dataset in [f"middlebury_{s}" for s in 'FHQ']:
-                    results = validate_middlebury(model.module, iters=args.valid_iters, split=args.val_dataset[-1])
-                else:
-                    raise ValueError(f"Unknown val_dataset: {args.val_dataset}")
+                results = validate_uwstereo(
+                    base_model,
+                    iters=args.valid_iters,
+                    max_samples=args.uwstereo_val_max_samples,
+                    seed=args.uwstereo_val_seed,
+                )
 
                 logger.write_dict(results)
 
                 model.train()
-                model.module.freeze_bn()
+                base_model.freeze_bn()
+                if distributed:
+                    dist.barrier()
 
             total_steps += 1
 
@@ -248,14 +266,21 @@ def train(args):
                 break
 
         if len(train_loader) >= 10000:
-            save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
-            logging.info(f"Saving file {save_path}")
-            torch.save(model.state_dict(), save_path)
+            if rank == 0:
+                save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
+                logging.info(f"Saving file {save_path}")
+                torch.save(model.state_dict(), save_path)
+        epoch += 1
 
-    print("FINISHED TRAINING")
+    if rank == 0:
+        print("FINISHED TRAINING")
     logger.close()
     PATH = 'checkpoints/%s.pth' % args.name
-    torch.save(model.state_dict(), PATH)
+    if rank == 0:
+        torch.save(model.state_dict(), PATH)
+
+    if distributed:
+        dist.destroy_process_group()
 
     return PATH
 
@@ -274,10 +299,13 @@ if __name__ == '__main__':
     parser.add_argument('--image_size', type=int, nargs='+', default=[320, 720], help="size of the random image crops used during training.")
     parser.add_argument('--train_iters', type=int, default=16, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
+   
+
 
     # Validation parameters
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during validation forward pass')
-    parser.add_argument('--val_dataset', default='things', choices=['things', 'eth3d', 'kitti', 'uwstereo'] + [f"middlebury_{s}" for s in 'FHQ'], help='dataset for periodic validation')
+    parser.add_argument('--uwstereo_val_max_samples', type=int, default=0, help='max UW Stereo samples to evaluate (0 = all)')
+    parser.add_argument('--uwstereo_val_seed', type=int, default=0, help='random seed for UW Stereo sampling')
 
     # Architecure choices
     parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
@@ -296,9 +324,6 @@ if __name__ == '__main__':
     parser.add_argument('--do_flip', default=False, choices=['h', 'v'], help='flip the images horizontally or vertically')
     parser.add_argument('--spatial_scale', type=float, nargs='+', default=[0, 0], help='re-scale the images randomly')
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
-    parser.add_argument('--uwstereo_root', default='datasets/uwstereo/UWScene', help='root folder for UW Stereo data')
-    parser.add_argument('--uwstereo_train_list', default='all_train.txt', help='UW Stereo train list file')
-    parser.add_argument('--uwstereo_val_list', default='all_test.txt', help='UW Stereo validation list file')
     args = parser.parse_args()
 
     torch.manual_seed(1234)
