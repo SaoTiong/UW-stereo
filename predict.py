@@ -115,7 +115,7 @@ if __name__ == '__main__':
     parser.add_argument('--corr_levels', type=int, default=4)
     parser.add_argument('--corr_radius', type=int, default=4)
     parser.add_argument('--n_downsample', type=int, default=2)
-    parser.add_argument('--context_norm', type=str, default="batch", choices=['group', 'batch', 'instance', 'none'])
+    parser.add_argument('--context_norm', type=str, default="instance", choices=['group', 'batch', 'instance', 'none'])
     parser.add_argument('--slow_fast_gru', action='store_true')
     parser.add_argument('--n_gru_layers', type=int, default=3)
 
