@@ -5,14 +5,14 @@ import cv2
 import open3d as o3d
 
 # ===== USER CONFIG =====
-LEFT_DIR = "/home/tong/recordings/uwstereo_test/tower/left2"
-DISP_DIR = "/home/tong/recordings/uwstereo_test/tower/pred2train/disparity"
-COV_DIR = "/home/tong/recordings/uwstereo_test/tower/pred2train/covariance"
+LEFT_DIR = "/home/tong/recordings/uwstereo_test/miramar_lake/left1"
+DISP_DIR = "/home/tong/recordings/uwstereo_test/miramar_lake/pred1train/disparity"
+COV_DIR = "/home/tong/recordings/uwstereo_test/miramar_lake/pred1train/covariance"
 EXT = "png"
-COV_THRESH = 1
-MAX_DEPTH = 1  # set to e.g. 50.0 to clamp far points 
+COV_THRESH = 100
+MAX_DEPTH = 10  # set to e.g. 50.0 to clamp far points 
 MIN_DEPTH = 0
-DISPLAY_MAX_DEPTH = 3  # fixed range for depth colormap
+DISPLAY_MAX_DEPTH = 2  # fixed range for depth colormap
 
 scale_x = 800 / 1600
 scale_y = 600 / 1200
